@@ -1,3 +1,5 @@
+
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import socket
 import json
 import time
@@ -41,7 +43,7 @@ class DroneClient:
     def close_connection(self):
         if self.sock:
             self.sock.close()
-        
+
 class DroneEnv(gym.Env):
     def __init__(self, mode='virtual'):
         super().__init__()
@@ -57,7 +59,6 @@ class DroneEnv(gym.Env):
         self.prev_velocity = np.array([0.0, 0.0], dtype=np.float64)
 
         self.observation_space = spaces.Box(-1000, 1000, shape=(7,), dtype=np.float32)
-
         self.action_space = spaces.Box(
             low=np.array([-MAX_SPEED, -MAX_SPEED, -MAX_YAW_RATE], dtype=np.float32),
             high=np.array([MAX_SPEED, MAX_SPEED, MAX_YAW_RATE], dtype=np.float32),
@@ -67,29 +68,42 @@ class DroneEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        angle = np.random.uniform(0,2 * np.pi)
-        radiius = np.random.uniform(50,500)
-        self.pos = np.array([
-            radiius * np.cos(angle),
-            radiius * np.sin(angle)
-        ], dtype=np.float64)
+        
+        # Если переданы options, используем их
+        if options and 'start_pos' in options and 'target_pos' in options:
+            self.pos = np.array(options['start_pos'], dtype=np.float64)
+            self.target = np.array(options['target_pos'], dtype=np.float64)
+        else:
+            # Случайная инициализация
+            angle = np.random.uniform(0, 2 * np.pi)
+            radius = np.random.uniform(50, 500)
+            self.pos = np.array([radius * np.cos(angle), radius * np.sin(angle)], dtype=np.float64)
+            
+            target_angle = np.random.uniform(0, 2 * np.pi)
+            target_radius = np.random.uniform(50, 500)
+            self.target = np.array([target_radius * np.cos(target_angle), target_radius * np.sin(target_angle)], dtype=np.float64)
+        
+      
+        self.smooth_pos = self.pos.copy()
         self.yaw = INITIAL_YAW
-        self.smooth_pos = np.array([0.0, 0.0], dtype=np.float64)
         self.steps = 0
         self.prev_dist = None
         self.prev_velocity = np.array([0.0, 0.0], dtype=np.float64)
-
-
-        target_angle = np.random.uniform(0,2 * np.pi)
-        target_radiius = np.random.uniform(50,500)
-        self.target = np.array([
-            target_radiius * np.cos(target_angle),
-            target_radiius * np.sin(target_angle)
-        ], dtype=np.float64)
+        
         if self.mode == 'ue5' and self.drone:
             self.drone.one_step(0, 0, 0)
         
         return self._get_obs(), {}
+
+    def set_scenario(self, start_pos, target_pos):
+        """Явный метод для установки сценария"""
+        self.pos = np.array(start_pos, dtype=np.float64)
+        self.target = np.array(target_pos, dtype=np.float64)
+        self.smooth_pos = self.pos.copy()  
+        self.yaw = INITIAL_YAW
+        self.steps = 0
+        self.prev_dist = None
+        self.prev_velocity = np.array([0.0, 0.0], dtype=np.float64)
 
     def step(self, action):
         vx, vy, yaw_rate = np.clip(
@@ -101,7 +115,6 @@ class DroneEnv(gym.Env):
         self.yaw += yaw_rate * DT
         self.yaw = self.yaw % 360
 
-
         if self.mode == 'virtual':
             if UDP_DELAY > 0:
                 time.sleep(UDP_DELAY * 0.5)
@@ -111,12 +124,10 @@ class DroneEnv(gym.Env):
             actual_vx = vx + noise_vx
             actual_vy = vy + noise_vy
 
-     
             self.pos = self.pos + np.array([actual_vx, actual_vy], dtype=np.float64) * DT
             self.smooth_pos = self.smooth_pos * 0.8 + self.pos * 0.2
             self.pos = self.smooth_pos
             self.pos = np.clip(self.pos, -BOUNDARY, BOUNDARY)
-
         else:
             if self.drone:
                 state = self.drone.one_step(vx, vy, yaw_rate)
@@ -127,53 +138,36 @@ class DroneEnv(gym.Env):
 
         self.steps += 1
 
-      ##
+       
         dist = np.linalg.norm(self.pos - self.target)
-        reward = -dist / 200.0
-
+        
+      
+        reward = -dist * 0.01
+        
+   
         if self.prev_dist is not None:
             delta = self.prev_dist - dist
-            if delta > 1:
-                reward += 5.0 * (delta / 10)
-            elif delta < -1.0:
-                reward -= 2.0
+            reward += delta * 0.5  
+        
+    
+        reward -= 0.1
 
-        if dist > 0 and np.linalg.norm([vx, vy]) > 10.0:
-            to_target = self.target - self.pos
-            velocity = np.array([vx, vy], dtype=np.float64)
-            cos_angle = np.dot(to_target, velocity) / (np.linalg.norm(to_target) * np.linalg.norm(velocity) + 0.001)
-            reward += 4.0 * max(0, cos_angle)
-            if cos_angle < 0:
-                reward -= 1
-
-        if abs(vx) <= 1.0 and abs(vy) <= 1.0:
-            reward -= 1.0
-
-        if hasattr(self, 'prev_velocity'):
-            angle_change = np.abs(np.arctan2(vy, vx) - np.arctan2(self.prev_velocity[1], self.prev_velocity[0]))
-            if angle_change > 0.5:
-                reward -= 0.003
-        self.prev_velocity = np.array([vx, vy], dtype=np.float64)
-
-        speed = np.linalg.norm([vx, vy])
-        if speed > 0.5:
-            reward += 0.2
+        reward -= 0.0001 * (vx**2 + vy**2 + yaw_rate**2)
 
         done = False
+        
+
         if dist < REACH_RADIUS:
-            time_bonus = max(0, (800 - self.steps) / 800) * 100
-            reward += 200 + time_bonus
+            reward += 100.0 + max(0, (MAX_STEPS - self.steps) / MAX_STEPS) * 50
             done = True
             print("=" * 50)
             print(f" Долетел! Шаг {self.steps}, расстояние {dist:.1f}")
             print("=" * 50)
 
+     
         if dist > MAX_DISTANCE:
-            reward -= 200.0
+            reward -= 100.0
             done = True
-
-        if self.steps > 400 and dist > 300:
-            reward -= 0.1
 
         self.prev_dist = dist
         truncated = self.steps >= MAX_STEPS
@@ -182,7 +176,7 @@ class DroneEnv(gym.Env):
             'pos': tuple(self.pos.tolist()),
             'dist': float(dist),
             'steps': self.steps,
-            'speed': float(speed)
+            'speed': float(np.linalg.norm([vx, vy]))
         }
 
         return self._get_obs(), reward, done, truncated, info
@@ -190,19 +184,19 @@ class DroneEnv(gym.Env):
     def _get_obs(self):
         return np.array([
             self.pos[0] / 1000.0,
-            self.pos[1] / 1000.0 ,
-            self.target[0] / 1000.0 ,
-            self.target[1]/ 1000.0 ,
+            self.pos[1] / 1000.0,
+            self.target[0] / 1000.0,
+            self.target[1] / 1000.0,
             self.yaw / 360,
-            self.prev_velocity[0]   / MAX_SPEED if hasattr(self, 'prev_velocity') else 0.0,
-            self.prev_velocity[1]  / MAX_SPEED if hasattr(self, 'prev_velocity') else 0.0
+            self.prev_velocity[0] / MAX_SPEED if hasattr(self, 'prev_velocity') else 0.0,
+            self.prev_velocity[1] / MAX_SPEED if hasattr(self, 'prev_velocity') else 0.0
         ], dtype=np.float32)
 
     def close(self):
         if self.mode == 'ue5' and self.drone:
             self.drone.close_connection()
         return super().close()
-
+    
 
 def train_ue5():
     env = DroneEnv(mode='ue5')
@@ -212,43 +206,45 @@ def train_ue5():
     env.close()
     print('Hyina study')
 
+
 def train():
-    env = DroneEnv(mode='virtual')
+    def make_env():
+        def _init():
+            env = DroneEnv(mode='virtual')
+            return env
+        return _init
+    
+  
+    env = DummyVecEnv([make_env()])
+    
+
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=1000.)
+    
     model = PPO(
         'MlpPolicy',
         env,
         verbose=1,
-        learning_rate=LEARNING_RATE,
-        n_steps=PPO_N_STEPS,
-        batch_size=PPO_BATCH_SIZE,
-        n_epochs=PPO_N_EPOCHS,
-        gamma=PPO_GAMMA,
-        gae_lambda=PPO_GAE_LAMBDA,
-        clip_range=PPO_CLIP_RANGE,
-        ent_coef=PPO_ENT_COEF,
+        learning_rate=2.5e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
         tensorboard_log=TENSORBOARD_LOG,
     )
-#     eval_callback = EvalCallback(
-#     env,
-#     best_model_save_path='./models/',
-#     log_path='./logs/',
-#     eval_freq=10000,
-#     deterministic=True,
-#     render=False,
-#     verbose=1
-# )
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        # callback=eval_callback,
-        progress_bar=True
-    )
-    model.save(MODEL_SAVE_PATH)
-    env.close()
-    print('Hyina study')
-
     
-
-
+    
+    print("Начало обучения (2 миллиона шагов)...")
+    model.learn(total_timesteps=400_000, progress_bar=True)
+    
+    
+    model.save(MODEL_SAVE_PATH)
+    env.save("vec_normalize.pkl")
+    env.close()
+    print(' Обучение завершено!')
+    
 def test():
     print("Тестирование агента...")
     
