@@ -97,34 +97,38 @@ class DroneEnv(gym.Env):
         self.steps += 1
 
 
-
+        reward = 0.0
         dist = np.linalg.norm(self.pos - self.target)
-        reward = -dist / 300
+        reward = -dist / 350
         ###фикс наград и наказаний 
         #если движется к цели 
         if self.prev_dist is not None:
             delta = self.prev_dist - dist
             if delta > 1:
-                reward += 2.0
+                reward += 3.0 * (delta / 10)
             if delta < -1.0:
-                reward -= 1.0
+                reward -= 2.0
         #если хотя бы смотрит на цель
 
         if dist > 0:
             to_target = self.target - self.pos
             velocity = np.array([vx,vy])
             vel_mag = np.linalg.norm(velocity)
-            if vel_mag > 0.1:
-                cos_angle = np.dot(to_target, velocity) / (np.linalg.norm(to_target) * np.linalg.norm(vel_mag) + 0.001) 
-                reward += 3 * max(0, cos_angle)
+            if vel_mag > 1.0:
+                cos_angle = np.dot(to_target, velocity) / (np.linalg.norm(to_target) * np.linalg.norm(vel_mag) ) 
+                reward += 2.5 * max(0, cos_angle)
 
 
         if abs(vx) <= 1.0 and abs(vy) <= 1.0:
-            reward -= 0.5
-
+            reward -= 0.09
+        if hasattr(self, 'prev_velocity'):
+            angle_change = np.abs(np.arctan2(vy, vx) - np.arctan2(self.prev_velocity[1], self.prev_velocity[0]))
+            if angle_change > 0.5: 
+                reward -= 0.3
+        self.prev_velocity = np.array([vx, vy])
         speed = np.linalg.norm([vx,vy])
         if speed > 10:
-            reward += speed / 600
+            reward += speed / 400
         #достиг цели
         done = False
         if dist < REACH_RADIUS:
@@ -142,7 +146,7 @@ class DroneEnv(gym.Env):
        
         if self.steps > 400 and dist > 300:
             reward -= 0.1
-            
+
         self.prev_dist = dist
         
         truncated = self.steps >= MAX_STEPS
