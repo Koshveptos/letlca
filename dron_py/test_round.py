@@ -3,89 +3,137 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from drone_env import DroneEnv
-from config import MAX_STEPS, VEC_PATH, MODEL_PATH
+from mission_wrapper import MissionWrapper
+from config import MODEL_PATH, VEC_PATH, MAX_STEPS, BOUNDARY
 
 
+# ---------------- LOAD ----------------
 def make_env():
-    return DroneEnv()
+    return MissionWrapper(DroneEnv())
 
 
-def build_env():
+def load_env():
     env = DummyVecEnv([make_env])
-
     env = VecNormalize.load(VEC_PATH, env)
     env.training = False
     env.norm_reward = False
-
     return env
 
 
-def test_waypoints():
-    print("=" * 60)
-    print("MULTI-WAYPOINT TEST")
+# ---------------- SAFE ACTION ----------------
+def fix_action(action):
+    return np.array(action, dtype=np.float32).reshape(1, 2)
+
+
+# ---------------- UNWRAP ----------------
+def get_base_env(env):
+    base = env.envs[0]
+    if hasattr(base, "env"):
+        return base.env
+    return base
+
+
+# ---------------- SINGLE TEST ----------------
+def test_single():
+    print("\n" + "=" * 60)
+    print("SINGLE TEST")
     print("=" * 60)
 
-    env = build_env()
+    env = load_env()
     model = PPO.load(MODEL_PATH)
 
-    model.set_env(env)
+    obs = env.reset()
+    e = get_base_env(env)
 
-    num_waypoints = 12
+    target = e.target.copy()
+
+    total_reward = 0
+
+    for step in range(MAX_STEPS):
+
+        action, _ = model.predict(obs, deterministic=True)
+        action = fix_action(action)
+
+        obs, reward, done, info = env.step(action)
+
+        total_reward += reward[0]
+
+        if done[0]:
+            break
+
+    final = e.position.copy()
+    dist = np.linalg.norm(final - target)
+
+    print("\nRESULT:")
+    print("TARGET       :", target)
+    print("FINAL POS    :", final)
+    print("DIST         :", round(dist, 2))
+    print("REACHED      :", dist < 30)
+    print("SUCCESS      :", "YES" if dist < 30 else "NO")
+    print("TOTAL REWARD :", round(total_reward, 2))
+    print("STEPS        :", step)
+
+
+# ---------------- CHAIN TEST ----------------
+def test_chain():
+    print("\n" + "=" * 60)
+    print("CHAIN TEST")
+    print("=" * 60)
+
+    env = load_env()
+    model = PPO.load(MODEL_PATH)
 
     waypoints = [
-        np.array([np.random.uniform(50, 950),
-                  np.random.uniform(50, 950)], dtype=np.float32)
-        for _ in range(num_waypoints)
+        np.random.uniform(0, BOUNDARY, 2).astype(np.float32)
+        for _ in range(10)
     ]
 
-    start = np.array([832.89, 605.99], dtype=np.float32)
-
     obs = env.reset()
+    e = get_base_env(env)
 
-    # unwrap VecEnv
-    env.envs[0].position = start.copy()
-    env.envs[0].target = waypoints[0].copy()
-    env.envs[0].yaw = np.random.uniform(-180, 180)
-    env.envs[0].velocity[:] = 0
-    env.envs[0].current_step = 0
-    env.envs[0].prev_distance = np.linalg.norm(
-        env.envs[0].target - env.envs[0].position
-    )
+    e.position = np.random.uniform(0, BOUNDARY, 2)
+    e.waypoints = np.array(waypoints)
+    e.wp_idx = 0
+    e.target = waypoints[0]
+    e.mission_mode = True
 
     total_steps = 0
 
     for i, wp in enumerate(waypoints):
 
-        env.envs[0].target = wp.copy()
-        env.envs[0].current_step = 0
+        print("\nWAYPOINT", i + 1)
+        print("TARGET:", wp)
 
-        done = False
-        steps = 0
+        reached = False
 
-        while not done and steps < MAX_STEPS:
+        for step in range(MAX_STEPS):
 
             action, _ = model.predict(obs, deterministic=True)
+            action = fix_action(action)
 
             obs, reward, done, info = env.step(action)
 
-            steps += 1
             total_steps += 1
 
-            done = done[0]
+            dist = np.linalg.norm(e.position - wp)
 
-        pos = env.envs[0].position
-        print("-" * 40)
-        print(f"WAYPOINT {i + 1}")
-        print(f"POS    : {pos}")
-        print(f"TARGET : {wp}")
-        print(f"STEPS  : {steps}")
+            if dist < 30:
+                reached = True
+                break
 
-    env.close()
+            if done[0]:
+                break
 
+        print("FINAL POS :", e.position)
+        print("DIST      :", round(dist, 2))
+        print("REACHED   :", reached)
+        print("WP IDX    :", e.wp_idx)
+
+    print("\nTOTAL STEPS:", total_steps)
     print("=" * 60)
-    print(f"TOTAL STEPS: {total_steps}")
-    print("=" * 60)
 
 
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    test_waypoints()
+    test_single()
+    test_chain()

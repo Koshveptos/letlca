@@ -27,7 +27,7 @@ NOISE_STD = 2.0
 
 ## for pro 
 
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 170_000
 
 LEARNING_RATE = 3e-4
 
@@ -52,9 +52,9 @@ VF_COEF = 0.5
 
 #files
 
-MODEL_PATH = "models/ppo_drone"
+MODEL_PATH = "drone_model.zip"
 
-VEC_PATH = "models/vec_normalize.pkl"
+VEC_PATH = "vecnorm.pkl"
 
 LOG_DIR = "logs/"
 

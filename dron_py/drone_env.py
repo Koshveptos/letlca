@@ -1,188 +1,164 @@
 import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
+from gymnasium import spaces
 
-from config import *
-from utils import random_scenario, clamp_position
+from config import BOUNDARY, MAX_SPEED, DT, MAX_STEPS, REACH_RADIUS
 
 
 class DroneEnv(gym.Env):
-    metadata = {"render_modes": []}
 
     def __init__(self):
         super().__init__()
 
-        # [forward_thrust, yaw_rate]
-        self.action_space = spaces.Box( # определение действий агента 
-            low=np.array([0.0, -1.0], dtype=np.float32), # сила тяги
-            high=np.array([1.0, 1.0], dtype=np.float32), # скорость поворота  left right 
-            dtype=np.float32,
+        self.action_space = spaces.Box(
+            low=np.array([0.0, -1.0], dtype=np.float32),
+            high=np.array([1.0,  1.0], dtype=np.float32),
         )
 
-        
-        self.observation_space = spaces.Box( # определение что видит агент
+        self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(9,), # 9 числе из obs, каждое от -1 до 1
-            dtype=np.float32,
+            shape=(5,),
+            dtype=np.float32
         )
 
-        # stat
-        # zeros - нулевка матрица 
-        self.position = np.zeros(2, dtype=np.float32)  # 2 значения глобал коорд
-        self.velocity = np.zeros(2, dtype=np.float32) # 2 значения вектор скорости по x y 
+        self.position = np.zeros(2, dtype=np.float32)
+        self.velocity = np.zeros(2, dtype=np.float32)
+        self.target = np.zeros(2, dtype=np.float32)
 
-        self.target = np.zeros(2, dtype=np.float32) # аналогично координаты цели 
+        self.yaw = 0.0
+        self.prev_distance = 0.0
+        self.last_thrust = 0.0
+        self.step_count = 0
 
-        self.yaw = 0.0  
+        # mission
+        self.waypoints = None
+        self.wp_idx = 0
+        self.mission_mode = False
 
-        self.prev_distance = 0.0 # пред расстояние для расчета прогресса 
-        self.current_step = 0
-        self.success = False
-
+    # ---------------- RESET ----------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.current_step = 0
-        self.success = False
+        self.step_count = 0
         self.velocity[:] = 0
-
-        self.position, self.target = random_scenario()
-
+        self.last_thrust = 0.0
         self.yaw = np.random.uniform(-180, 180)
 
-        self.prev_distance = np.linalg.norm(self.target - self.position)
+        # mission mode
+        if options and "waypoints" in options:
+            self.mission_mode = True
+            self.waypoints = np.array(options["waypoints"], dtype=np.float32)
+            self.wp_idx = 0
 
-        return self._get_observation(), {
-            "position_global": self.position.copy(),
-            "target_global": self.target.copy(),
-            "yaw": self.yaw,
-        }
+            self.position = np.array(options.get(
+                "start",
+                np.random.uniform(0, BOUNDARY, 2)
+            ), dtype=np.float32)
 
+            self.target = self.waypoints[0]
 
+        else:
+            self.mission_mode = False
+            self.waypoints = None
+            self.wp_idx = 0
+
+            self.position = np.random.uniform(0, BOUNDARY, 2)
+            self.target = np.random.uniform(0, BOUNDARY, 2)
+
+        self._clip()
+        self.prev_distance = self._dist()
+
+        return self._obs(), self._info()
+
+    # ---------------- STEP ----------------
     def step(self, action):
+        self.step_count += 1
 
-        self.current_step += 1
+        thrust = float(np.clip(action[0], 0, 1))
+        yaw_rate = float(np.clip(action[1], -1, 1))
 
-        thrust = np.clip(action[0], 0.0, 1.0)
-        yaw_rate = np.clip(action[1], -1.0, 1.0)
+        self.last_thrust = thrust
 
-        # new rot
         self.yaw += yaw_rate * 5.0
-        self.yaw %= (self.yaw + 180) % 360 - 180
+        self.yaw = (self.yaw + 180) % 360 - 180
 
-        #vector to targ
-        yaw_rad = np.deg2rad(self.yaw)
+        yaw = np.deg2rad(self.yaw)
 
-        forward = np.array([
-            np.cos(yaw_rad),
-            np.sin(yaw_rad)
-        ], dtype=np.float32)
+        direction = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
 
-        # ph
-        self.velocity = forward * thrust * MAX_SPEED
-
+        self.velocity = direction * thrust * MAX_SPEED
         self.position += self.velocity * DT
-        self.position = clamp_position(self.position)
 
-      
+        self._clip()
+
+        dist = self._dist()
         to_target = self.target - self.position
-        dist = np.linalg.norm(to_target)
 
-        #награды
         reward = 0.0
+        reward += (self.prev_distance - dist) * 6.0
+        reward -= dist / BOUNDARY
 
-       
-        reward -= dist / 1000.0
+        vel = np.linalg.norm(self.velocity)
+        if vel > 1e-6:
+            reward += 0.3 * np.dot(
+                self.velocity / vel,
+                to_target / (dist + 1e-8)
+            )
 
-        
-        progress = self.prev_distance - dist
-        reward += progress * 2.0
-
-        
-        norm_t = np.linalg.norm(to_target) + 1e-8
-        norm_v = np.linalg.norm(self.velocity) + 1e-8
-
-        alignment = np.dot(to_target, self.velocity) / (norm_t * norm_v)
-        reward += 0.5 * alignment
-
-    
-        local_target = self._world_to_local(to_target)
-        angle_to_target = np.arctan2(local_target[1], local_target[0])
-        reward += 0.2 * np.cos(angle_to_target)
-
-      
         terminated = False
-        if dist < REACH_RADIUS:
-            reward += 100.0
-            terminated = True
-            self.success = True
+        truncated = self.step_count >= MAX_STEPS
 
-      
-        truncated = self.current_step >= MAX_STEPS
+        # ---------------- WAYPOINT LOGIC (INSIDE ENV) ----------------
+        if self.mission_mode and dist < REACH_RADIUS:
+            reward += 60.0
+
+            self.wp_idx += 1
+
+            if self.wp_idx >= len(self.waypoints):
+                terminated = True
+            else:
+                self.target = self.waypoints[self.wp_idx]
+                self.prev_distance = self._dist()
+                self.velocity[:] = 0
+
+        elif dist < REACH_RADIUS:
+            reward += 60.0
+            terminated = True
 
         self.prev_distance = dist
 
-        return self._get_observation(), reward, terminated, truncated, self._get_info(dist)
+        return self._obs(), reward, terminated, truncated, self._info()
 
-    
-    def _get_observation(self):
-
+    # ---------------- OBS ----------------
+    def _obs(self):
         to_target = self.target - self.position
         local = self._world_to_local(to_target)
 
-        obs = np.array([
-            self.position[0] / BOUNDARY,
-            self.position[1] / BOUNDARY,
-
-            self.target[0] / BOUNDARY,
-            self.target[1] / BOUNDARY,
-
+        return np.array([
             local[0] / BOUNDARY,
             local[1] / BOUNDARY,
-
             np.cos(np.deg2rad(self.yaw)),
             np.sin(np.deg2rad(self.yaw)),
-
-            np.linalg.norm(self.velocity) / MAX_SPEED,
+            self.last_thrust
         ], dtype=np.float32)
 
-        return obs
+    def _world_to_local(self, v):
+        yaw = np.deg2rad(self.yaw)
+        c, s = np.cos(-yaw), np.sin(-yaw)
+        return np.array([[c, -s], [s, c]]) @ v
 
-    
-    def _world_to_local(self, vec):
+    def _dist(self):
+        return np.linalg.norm(self.target - self.position)
 
-        yaw_rad = np.deg2rad(self.yaw)
+    def _clip(self):
+        self.position = np.clip(self.position, 0, BOUNDARY)
 
-        c = np.cos(-yaw_rad)
-        s = np.sin(-yaw_rad)
-
-        rot = np.array([
-            [c, -s],
-            [s,  c]
-        ], dtype=np.float32)
-
-        return rot @ vec
-
-
-    def _get_info(self, dist):
-
-        local_target = self._world_to_local(self.target - self.position)
-
+    def _info(self):
         return {
-            
-            "position_global": self.position.copy(),
-            "target_global": self.target.copy(),
-
-            
-            "target_local": local_target,
-
-           
-            "distance": float(dist),
+            "pos": self.position.copy(),
+            "target": self.target.copy(),
+            "dist": float(self._dist()),
             "yaw": float(self.yaw),
-            "steps": self.current_step,
+            "wp": self.wp_idx
         }
-
-   
-    def close(self):
-        return super().close()
